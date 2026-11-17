@@ -1,7 +1,8 @@
 use crate::config::{log_debug, log_warn, STATS};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use sha2::Sha256;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -21,6 +22,26 @@ const SESSION_ID_LEN: usize = 32;
 const TIMESTAMP_TOLERANCE: i64 = 120;
 const TLS_APPDATA_MAX: usize = 16384;
 
+const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+const EXT_KEY_SHARE: u16 = 0x0033;
+
+const GROUP_X25519: u16 = 0x001d;
+const GROUP_X25519MLKEM768: u16 = 0x11ec;
+
+const X25519_KEY_LEN: usize = 32;
+const X25519MLKEM768_CLIENT_SHARE_LEN: usize = 1216;
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+
+// TLS 1.3 suites in the order a typical server picks them from the client list
+const CIPHER_PREFERENCE: [u16; 3] = [0x1301, 0x1303, 0x1302];
+
+// Without a site profile stay near the 64-byte record that telemt passed DPI with.
+const FALLBACK_APPDATA_MIN: usize = 64;
+const FALLBACK_APPDATA_MAX: usize = 160;
+
+const SERVER_HELLO_DELAY_MIN_MS: u64 = 8;
+const SERVER_HELLO_DELAY_MAX_MS: u64 = 24;
+
 const READ_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_RECORD_TIMEOUT: Duration = Duration::from_secs(10);
 const MASKING_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,33 +49,195 @@ const MASKING_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CCS_FRAME: [u8; 6] = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
 
 const SH_RANDOM_OFF: usize = 11;
-const SH_SESSID_OFF: usize = 44;
-const SH_PUBKEY_OFF: usize = 89;
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Default)]
+pub struct ClientHelloInfo {
+    cipher_suites: HashSet<u16>,
+    key_shares: HashMap<u16, usize>,
+}
 
 pub struct FakeTlsStream {
     pub read: Box<dyn AsyncRead + Send + Unpin>,
     pub write: Box<dyn AsyncWrite + Send + Unpin>,
 }
 
-fn server_hello_template() -> Vec<u8> {
-    let mut v = Vec::with_capacity(128);
-    v.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x7a]);
-    v.extend_from_slice(&[0x02, 0x00, 0x00, 0x76]);
-    v.extend_from_slice(&[0x03, 0x03]);
-    v.extend_from_slice(&[0u8; 32]);
-    v.push(0x20);
-    v.extend_from_slice(&[0u8; 32]);
-    v.extend_from_slice(&[0x13, 0x01, 0x00]);
-    v.extend_from_slice(&[0x00, 0x2e, 0x00]);
-    v.extend_from_slice(&[0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
-    v.extend_from_slice(&[0u8; 32]);
-    v.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
-    v
+fn be16(data: &[u8], pos: usize) -> Option<usize> {
+    if pos + 2 > data.len() {
+        return None;
+    }
+    Some(u16::from_be_bytes([data[pos], data[pos + 1]]) as usize)
 }
 
-fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<([u8; 32], [u8; 32], i64)> {
+/// Extract offered cipher suites and key_share groups from a ClientHello.
+/// Returns empty info on malformed input so the caller falls back to the
+/// plain X25519 / TLS_AES_128_GCM_SHA256 answer.
+pub fn parse_client_hello(data: &[u8]) -> ClientHelloInfo {
+    let mut info = ClientHelloInfo::default();
+    if data.len() < 43 {
+        return info;
+    }
+
+    let mut pos = 5 + 4 + 2 + CLIENT_RANDOM_LEN;
+    let sid_len = data[pos] as usize;
+    pos += 1 + sid_len;
+    if pos + 2 > data.len() {
+        return info;
+    }
+
+    let suites_len = match be16(data, pos) {
+        Some(v) => v,
+        None => return info,
+    };
+    pos += 2;
+    let suites_end = pos + suites_len;
+    if suites_end > data.len() {
+        return info;
+    }
+    while pos + 2 <= suites_end {
+        info.cipher_suites
+            .insert(u16::from_be_bytes([data[pos], data[pos + 1]]));
+        pos += 2;
+    }
+    pos = suites_end;
+
+    if pos >= data.len() {
+        return info;
+    }
+    let comp_len = data[pos] as usize;
+    pos += 1 + comp_len;
+    if pos + 2 > data.len() {
+        return info;
+    }
+
+    let ext_total = match be16(data, pos) {
+        Some(v) => v,
+        None => return info,
+    };
+    pos += 2;
+    let ext_end = std::cmp::min(pos + ext_total, data.len());
+
+    while pos + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let ext_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        if ext_type == EXT_KEY_SHARE && pos + 2 <= ext_end {
+            let shares_len = be16(data, pos).unwrap_or(0);
+            let shares_end = std::cmp::min(pos + 2 + shares_len, ext_end);
+            let mut off = pos + 2;
+            while off + 4 <= shares_end {
+                let group = u16::from_be_bytes([data[off], data[off + 1]]);
+                let key_len = u16::from_be_bytes([data[off + 2], data[off + 3]]) as usize;
+                off += 4 + key_len;
+                if off <= shares_end {
+                    info.key_shares.entry(group).or_insert(key_len);
+                }
+            }
+        }
+
+        pos += ext_len;
+    }
+
+    info
+}
+
+fn x25519_public_key() -> [u8; X25519_KEY_LEN] {
+    // The client never derives keys from the fake handshake; keep the value
+    // shape-valid (field element below 2^255) as the original core does.
+    let mut key = [0u8; X25519_KEY_LEN];
+    rand::thread_rng().fill_bytes(&mut key);
+    key[X25519_KEY_LEN - 1] &= 0x7f;
+    key
+}
+
+fn select_cipher_suite(info: &ClientHelloInfo) -> u16 {
+    for suite in CIPHER_PREFERENCE {
+        if info.cipher_suites.contains(&suite) {
+            return suite;
+        }
+    }
+    CIPHER_PREFERENCE[0]
+}
+
+fn server_key_share(info: &ClientHelloInfo) -> (u16, Vec<u8>) {
+    // Mirror the hybrid post-quantum group when the client offers it, as
+    // current browsers and servers do; the client never derives keys from it.
+    if info.key_shares.get(&GROUP_X25519MLKEM768) == Some(&X25519MLKEM768_CLIENT_SHARE_LEN) {
+        let mut key = vec![0u8; MLKEM768_CIPHERTEXT_LEN + X25519_KEY_LEN];
+        rand::thread_rng().fill_bytes(&mut key[..MLKEM768_CIPHERTEXT_LEN]);
+        key[MLKEM768_CIPHERTEXT_LEN..].copy_from_slice(&x25519_public_key());
+        return (GROUP_X25519MLKEM768, key);
+    }
+    (GROUP_X25519, x25519_public_key().to_vec())
+}
+
+fn build_server_hello(
+    secret: &[u8],
+    client_random: &[u8; 32],
+    session_id: &[u8],
+    info: &ClientHelloInfo,
+) -> Vec<u8> {
+    let (group, key_exchange) = server_key_share(info);
+
+    let mut extensions = Vec::with_capacity(64 + key_exchange.len());
+    extensions.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+    extensions.extend_from_slice(&2u16.to_be_bytes());
+    extensions.extend_from_slice(&0x0304u16.to_be_bytes());
+    extensions.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+    extensions.extend_from_slice(&((4 + key_exchange.len()) as u16).to_be_bytes());
+    extensions.extend_from_slice(&group.to_be_bytes());
+    extensions.extend_from_slice(&(key_exchange.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&key_exchange);
+
+    let cipher = select_cipher_suite(info);
+    let mut body = Vec::with_capacity(96 + session_id.len() + extensions.len());
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(session_id.len() as u8);
+    body.extend_from_slice(session_id);
+    body.extend_from_slice(&cipher.to_be_bytes());
+    body.push(0x00);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut message = Vec::with_capacity(4 + body.len());
+    message.push(0x02);
+    let body_len = body.len() as u32;
+    message.push((body_len >> 16) as u8);
+    message.push((body_len >> 8) as u8);
+    message.push(body_len as u8);
+    message.extend_from_slice(&body);
+
+    let mut response = Vec::with_capacity(5 + message.len() + 6 + 5 + FALLBACK_APPDATA_MAX);
+    response.push(TLS_RECORD_HANDSHAKE);
+    response.extend_from_slice(&[0x03, 0x03]);
+    response.extend_from_slice(&(message.len() as u16).to_be_bytes());
+    response.extend_from_slice(&message);
+    response.extend_from_slice(&CCS_FRAME);
+
+    let rand_len = rand::thread_rng()
+        .gen_range(FALLBACK_APPDATA_MIN..=FALLBACK_APPDATA_MAX);
+    let mut encrypted_data = vec![0u8; rand_len];
+    rand::thread_rng().fill_bytes(&mut encrypted_data);
+    response.push(TLS_RECORD_APPDATA);
+    response.push(0x03);
+    response.push(0x03);
+    response.extend_from_slice(&(rand_len as u16).to_be_bytes());
+    response.extend_from_slice(&encrypted_data);
+
+    let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+    mac.update(client_random);
+    mac.update(&response);
+    let server_random = mac.finalize().into_bytes();
+
+    let mut final_bytes = response;
+    final_bytes[SH_RANDOM_OFF..SH_RANDOM_OFF + 32].copy_from_slice(&server_random);
+    final_bytes
+}
+
+fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<([u8; 32], Vec<u8>, i64)> {
     if data.len() < 43 {
         return None;
     }
@@ -96,46 +279,13 @@ fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<([u8; 32], [u8; 32]
         return None;
     }
 
-    let mut session_id = [0u8; 32];
+    let mut session_id = Vec::new();
     if data.len() >= SESSION_ID_OFFSET + SESSION_ID_LEN && data[43] == 0x20 {
         session_id
-            .copy_from_slice(&data[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN]);
+            .extend_from_slice(&data[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN]);
     }
 
     Some((client_random, session_id, timestamp))
-}
-
-fn build_server_hello(secret: &[u8], client_random: &[u8; 32], session_id: &[u8; 32]) -> Vec<u8> {
-    let mut sh = server_hello_template();
-    debug_assert_eq!(sh.len(), 128);
-    sh[SH_SESSID_OFF..SH_SESSID_OFF + 32].copy_from_slice(session_id);
-
-    let mut pubkey = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut pubkey);
-    sh[SH_PUBKEY_OFF..SH_PUBKEY_OFF + 32].copy_from_slice(&pubkey);
-
-    let mut response = Vec::with_capacity(128 + 6 + 5 + 2100);
-    response.extend_from_slice(&sh);
-    response.extend_from_slice(&CCS_FRAME);
-
-    let encrypted_size = 1900 + (rand::thread_rng().next_u32() % 201) as usize;
-    let mut encrypted_data = vec![0u8; encrypted_size];
-    rand::thread_rng().fill_bytes(&mut encrypted_data);
-    response.push(TLS_RECORD_APPDATA);
-    response.push(0x03);
-    response.push(0x03);
-    response.push((encrypted_size >> 8) as u8);
-    response.push(encrypted_size as u8);
-    response.extend_from_slice(&encrypted_data);
-
-    let mut mac = HmacSha256::new_from_slice(secret).unwrap();
-    mac.update(client_random);
-    mac.update(&response);
-    let server_random = mac.finalize().into_bytes();
-
-    let mut final_bytes = response;
-    final_bytes[SH_RANDOM_OFF..SH_RANDOM_OFF + 32].copy_from_slice(&server_random);
-    final_bytes
 }
 
 fn wrap_tls_record(data: &[u8]) -> Vec<u8> {
@@ -358,7 +508,13 @@ pub async fn server_handshake(
     match verify_client_hello(&client_hello, secret) {
         Some((client_random, session_id, ts)) => {
             log_debug(&format!("[{}] Fake TLS handshake ok (ts={})", label, ts));
-            let server_hello = build_server_hello(secret, &client_random, &session_id);
+            let info = parse_client_hello(&client_hello);
+            let server_hello = build_server_hello(secret, &client_random, &session_id, &info);
+            let delay_ms = {
+                let mut rng = rand::thread_rng();
+                rng.gen_range(SERVER_HELLO_DELAY_MIN_MS..=SERVER_HELLO_DELAY_MAX_MS)
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             if conn.write_all(&server_hello).await.is_err() {
                 return None;
             }
