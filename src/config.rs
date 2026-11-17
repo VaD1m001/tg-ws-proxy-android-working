@@ -60,6 +60,8 @@ pub const FRONTING_SNI: &str = "sprinthost.ru";
 // proxy/pool.py::_CfWorkerPool
 pub const CF_WORKER_POOL_MAX_AGE: f64 = 100.0;
 pub const CF_WORKER_PER_DC_LIMIT: usize = 1;
+pub const CF_WORKER_REFILL_BACKOFF_INITIAL: f64 = 1.0;
+pub const CF_WORKER_REFILL_BACKOFF_MAX: f64 = 3600.0;
 
 // WS пути — proxy/utils.py
 pub const WS_PATH: &str = "/apiws";

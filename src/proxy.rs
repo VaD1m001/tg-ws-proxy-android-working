@@ -524,6 +524,7 @@ pub struct CfWorkerEntry {
 pub struct CfWorkerPool {
     idle: Mutex<HashMap<i32, VecDeque<CfWorkerEntry>>>,
     refilling: Mutex<HashSet<i32>>,
+    refill_failures: Mutex<HashMap<i32, (u32, f64)>>,
     exhausted_until: Mutex<HashMap<String, f64>>,
     cancel_token: CancellationToken,
 }
@@ -533,6 +534,7 @@ impl CfWorkerPool {
         CfWorkerPool {
             idle: Mutex::new(HashMap::new()),
             refilling: Mutex::new(HashSet::new()),
+            refill_failures: Mutex::new(HashMap::new()),
             exhausted_until: Mutex::new(HashMap::new()),
             cancel_token,
         }
@@ -544,6 +546,9 @@ impl CfWorkerPool {
         fallback_dst: String,
         worker_domains: Vec<String>,
     ) -> Option<(RawWebSocket, String)> {
+        if POOL_SIZE.load(Ordering::Relaxed) <= 0 || worker_domains.is_empty() {
+            return None;
+        }
         let now = now_monotonic();
         let entry = {
             let mut map = self.idle.lock().await;
@@ -576,12 +581,29 @@ impl CfWorkerPool {
             }
             None => {
                 STATS.cf_pool_misses.fetch_add(1, Ordering::Relaxed);
+                self.schedule_refill(dc, fallback_dst, worker_domains).await;
                 None
             }
         }
     }
 
-    async fn schedule_refill(&self, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
+    async fn schedule_refill(
+        self: &Arc<Self>,
+        dc: i32,
+        fallback_dst: String,
+        worker_domains: Vec<String>,
+    ) {
+        if POOL_SIZE.load(Ordering::Relaxed) <= 0 || worker_domains.is_empty() {
+            return;
+        }
+        {
+            let failures = self.refill_failures.lock().await;
+            if let Some((_, after)) = failures.get(&dc) {
+                if now_monotonic() < *after {
+                    return;
+                }
+            }
+        }
         {
             let mut r = self.refilling.lock().await;
             if r.contains(&dc) {
@@ -589,8 +611,67 @@ impl CfWorkerPool {
             }
             r.insert(dc);
         }
-        // PER_DC_LIMIT уважаем через проверку размера в refill.
-        let _ = (fallback_dst, worker_domains);
+        let pool = self.clone();
+        let cancel = self.cancel_token.clone();
+        tokio::spawn(async move {
+            pool.refill_task(dc, fallback_dst, worker_domains, cancel).await;
+            pool.refilling.lock().await.remove(&dc);
+        });
+    }
+
+    async fn refill_task(
+        self: &Arc<Self>,
+        dc: i32,
+        fallback_dst: String,
+        worker_domains: Vec<String>,
+        cancel: CancellationToken,
+    ) {
+        let target = CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize);
+        if target == 0 {
+            return;
+        }
+        let cur = {
+            let map = self.idle.lock().await;
+            map.get(&dc).map(|b| b.len()).unwrap_or(0)
+        };
+        if cur >= target {
+            return;
+        }
+
+        let result = tokio::select! {
+            _ = cancel.cancelled() => {
+                // Shutting down: don't count this as a refill failure.
+                return;
+            }
+            r = self.connect_one(worker_domains, fallback_dst, dc) => r,
+        };
+
+        match result {
+            Some((ws, domain)) => {
+                let mut map = self.idle.lock().await;
+                map.entry(dc)
+                    .or_insert_with(VecDeque::new)
+                    .push_back(CfWorkerEntry {
+                        ws,
+                        created: now_monotonic(),
+                        worker_domain: domain,
+                    });
+                drop(map);
+                self.refill_failures.lock().await.remove(&dc);
+                ldebug!("CF worker pool refilled DC{}: ready", dc);
+            }
+            None => {
+                // Exponential backoff 1s..3600s as in the original core.
+                let mut failures = self.refill_failures.lock().await;
+                let count = failures.get(&dc).map(|(c, _)| *c).unwrap_or(0) + 1;
+                let shift = (count - 1).min(12);
+                let delay = (CF_WORKER_REFILL_BACKOFF_INITIAL * (2u64.pow(shift) as f64))
+                    .min(CF_WORKER_REFILL_BACKOFF_MAX);
+                failures.insert(dc, (count, now_monotonic() + delay));
+                drop(failures);
+                linfo!("CF worker pool refill failed for DC{}, retry in {:.0}s", dc, delay);
+            }
+        }
     }
 
     pub async fn refill_now(
@@ -599,46 +680,7 @@ impl CfWorkerPool {
         fallback_dst: String,
         worker_domains: Vec<String>,
     ) {
-        let should = {
-            let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
-                false
-            } else {
-                r.insert(dc);
-                true
-            }
-        };
-        if !should {
-            return;
-        }
-        let pool = self.clone();
-        let cancel = self.cancel_token.clone();
-        tokio::spawn(async move {
-            let _cancel = cancel;
-            {
-                let map = pool.idle.lock().await;
-                let cur = map.get(&dc).map(|b| b.len()).unwrap_or(0);
-                if cur >= CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize) {
-                    pool.refilling.lock().await.remove(&dc);
-                    return;
-                }
-            }
-            if let Some((ws, domain)) = pool
-                .connect_one(worker_domains.clone(), fallback_dst.clone(), dc)
-                .await
-            {
-                let mut map = pool.idle.lock().await;
-                map.entry(dc)
-                    .or_insert_with(VecDeque::new)
-                    .push_back(CfWorkerEntry {
-                        ws,
-                        created: now_monotonic(),
-                        worker_domain: domain,
-                    });
-                ldebug!("CF worker pool refilled DC{}: ready", dc);
-            }
-            pool.refilling.lock().await.remove(&dc);
-        });
+        self.schedule_refill(dc, fallback_dst, worker_domains).await;
     }
 
     async fn connect_one(
@@ -731,6 +773,7 @@ impl CfWorkerPool {
         self.close_all().await;
         self.idle.lock().await.clear();
         self.refilling.lock().await.clear();
+        self.refill_failures.lock().await.clear();
         self.exhausted_until.lock().await.clear();
     }
 }
