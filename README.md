@@ -13,6 +13,15 @@
 
 **TG WS Proxy Android** — это локальный **MTProto-прокси** для Telegram на Android. Приложение помогает частично решать проблемы и в ряде сценариев ускоряет работу мессенджера, перенаправляя трафик через защищённые CloudFlare WebSocket-соединения или напрямую к датацентрам Telegram.
 
+> **Неофициальная сборка (community build).** Это продолжение Android-порта
+> [amurcanov/tg-ws-proxy-android](https://github.com/amurcanov/tg-ws-proxy-android):
+> репозиторий автора заархивирован, поэтому обновления выходят здесь.
+> Версия 1.2.4 переносит часть изменений ядра 1.11.4 — см.
+> [RELEASE_NOTES_1.2.4.md](RELEASE_NOTES_1.2.4.md).
+> Оригинальный проект — [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy).
+> APK подписаны собственным ключом и **не устанавливаются поверх официальных**
+> (другая подпись — сначала удалите старую версию).
+
 ---
 
 <img width="972" height="696" alt="MyCollages (5)" src="https://github.com/user-attachments/assets/7c9b9f2a-fc60-4aee-b93d-db950e24555c" />
@@ -42,7 +51,7 @@ Telegram Android → Локальный MTProto (по умолчанию 127.0.0
 
 ## Быстрый старт
 
-1. Скачайте актуальный `APK` со **[страницы релизов](https://github.com/amurcanov/tg-ws-proxy-android/releases)**.
+1. Скачайте актуальный `APK` со **[страницы релизов](../../releases)**.
 2. Установите приложение на ваш Android-смартфон.
 3. Откройте **TG WS Proxy Android**.
 4. Ознакомьтесь со справкой внутри приложения.
@@ -77,6 +86,33 @@ Telegram Android → Локальный MTProto (по умолчанию 127.0.0
 
 ---
 
+## Сборка из исходников
+
+Требования: JDK 17+, Android SDK (platform 35, build-tools 35.0.0),
+NDK 27.2.12479018, Rust 1.70+ с целями `aarch64-linux-android` и
+`armv7-linux-androideabi`.
+
+1. Пропишите путь к SDK в `local.properties` (`sdk.dir=...`).
+2. `build_so.bat` — собирает `libtgwsproxy.so` для arm64-v8a и armeabi-v7a
+   в `app/src/main/jniLibs/` (каталог не хранится в репозитории).
+3. `gradlew.bat assembleRelease` — APK в `app/build/outputs/apk/`.
+
+Для подписи положите `release.keystore` в корень и укажите в
+`local.properties`:
+
+```properties
+KEYSTORE_FILE=../release.keystore
+KEYSTORE_PASSWORD=...
+KEY_ALIAS=...
+KEY_PASSWORD=...
+```
+
+`local.properties` и файлы `*.keystore`/`*.jks` в репозиторий не коммитятся.
+Точные версии инструментов, которыми собран релиз 1.2.4, перечислены в
+[RELEASE_NOTES_1.2.4.md](RELEASE_NOTES_1.2.4.md).
+
+---
+
 ## Лицензия
 
-Этот форк распространяется под лицензией **GPLv3**. Оригинальный код `tg-ws-proxy` от [Flowseal](https://github.com/Flowseal) доступен под лицензией **MIT**.
+Этот форк распространяется под лицензией **GPLv3**. Оригинальный код `tg-ws-proxy` от [Flowseal](https://github.com/Flowseal) доступен под лицензией **MIT**. См. также [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
